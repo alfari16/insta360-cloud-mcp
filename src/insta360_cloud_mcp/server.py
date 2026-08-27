@@ -22,6 +22,10 @@ DOWNLOAD_URL = "https://service-sg.insta360.com/cloud/service/media/download"
 REFRESH_TOKEN_URL = "https://openapi-g.insta360.com/account/v2/refreshToken"
 MEDIA_EDIT_MULTI_URL = "https://service-sg.insta360.com/cloud/service/media/edit/multi"
 
+# Cursor meaning "from the very beginning" — the API returns items updated *after*
+# this position, so anything higher silently yields an empty list.
+INITIAL_CURSOR = "0"
+
 # ── Headers ───────────────────────────────────────────────────────────
 CLOUD_HEADERS = {
     "x-insta360-platform": "pc/mac",
@@ -70,6 +74,19 @@ def _extract_token(data: dict, key: str) -> str | None:
     if not result and key in ("access_token", "token"):
         result = d.get("token")
     return result
+
+
+# The API answers with HTTP 200 even when auth has failed; the real status lives
+# in the JSON body's "code" field. Anything non-zero is an error.
+AUTH_ERROR_CODES = (401, 403)
+
+
+def _api_error_code(data: object) -> int | None:
+    if isinstance(data, dict):
+        code = data.get("code")
+        if isinstance(code, int) and code != 0:
+            return code
+    return None
 
 
 def _filename_from_url(url: str) -> str:
@@ -141,10 +158,12 @@ class Insta360Client:
             self.http.headers["x-insta360-trace-id"] = _trace_id()
             resp = await self.http.get(
                 SEARCH_LIST_URL,
-                params={"lastUpdatePosition": "256589726482965376"},
+                params={"lastUpdatePosition": INITIAL_CURSOR},
             )
-            return resp.status_code == 200
-        except httpx.HTTPError:
+            if resp.status_code != 200:
+                return False
+            return _api_error_code(resp.json()) not in AUTH_ERROR_CODES
+        except (httpx.HTTPError, ValueError):
             return False
 
     async def _login(self) -> None:
@@ -190,36 +209,61 @@ class Insta360Client:
         except httpx.HTTPError:
             return False
 
-    async def _api_get(self, url: str, params: dict | None = None) -> dict:
-        self.http.headers["x-insta360-trace-id"] = _trace_id()
-        resp = await self.http.get(url, params=params)
-        if resp.status_code in (400, 401, 403):
-            _log(f"[*] Got {resp.status_code}, attempting re-auth...")
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        params: dict | None = None,
+        payload: dict | None = None,
+    ) -> dict:
+        """Send a request, re-authenticating once if the token is rejected.
+
+        Auth failures arrive two ways: an HTTP 4xx, or an HTTP 200 whose body
+        carries code 401/403. Both must trigger a retry, or a stale token
+        silently degrades into empty results.
+        """
+        for attempt in (1, 2):
+            self.http.headers["x-insta360-trace-id"] = _trace_id()
+            if payload is not None:
+                self.http.headers["content-type"] = "application/json"
+            resp = await self.http.request(method, url, params=params, json=payload)
+
+            if resp.status_code not in (400, 401, 403):
+                resp.raise_for_status()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise RuntimeError(
+                        f"Non-JSON response from {url}: {resp.text[:200]}"
+                    ) from None
+                code = _api_error_code(data)
+                if code is None:
+                    return data
+                if code not in AUTH_ERROR_CODES:
+                    raise RuntimeError(
+                        f"Insta360 API error {code} from {url}: {data.get('msg')}"
+                    )
+
+            if attempt == 2:
+                raise RuntimeError(
+                    f"Authentication failed for {url} even after re-login. "
+                    f"Check INSTA360_EMAIL/INSTA360_PASSWORD, or delete {TOKEN_FILE}."
+                )
+            _log("[*] Token rejected, re-authenticating...")
             if not await self._refresh():
                 await self._login()
-            self.http.headers["x-insta360-trace-id"] = _trace_id()
-            resp = await self.http.get(url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+
+    async def _api_get(self, url: str, params: dict | None = None) -> dict:
+        return await self._request_json("GET", url, params=params)
 
     async def _api_put(self, url: str, payload: dict) -> dict:
-        self.http.headers["x-insta360-trace-id"] = _trace_id()
-        self.http.headers["content-type"] = "application/json"
-        resp = await self.http.put(url, json=payload)
-        if resp.status_code in (401, 403):
-            _log(f"[*] Got {resp.status_code}, attempting re-auth...")
-            if not await self._refresh():
-                await self._login()
-            self.http.headers["x-insta360-trace-id"] = _trace_id()
-            resp = await self.http.put(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._request_json("PUT", url, payload=payload)
 
     # ── Public API ────────────────────────────────────────────────
 
     async def search_list(self, last_update_position: str | None = None) -> dict:
-        # lastUpdatePosition is required by the API; use a known default as the initial cursor
-        cursor = last_update_position or "256589726482965376"
+        # lastUpdatePosition is required by the API; "0" starts from the beginning
+        cursor = last_update_position or INITIAL_CURSOR
         return await self._api_get(SEARCH_LIST_URL, {"lastUpdatePosition": cursor})
 
     async def fetch_all_media(self, last_update_position: str | None = None) -> list[dict]:
